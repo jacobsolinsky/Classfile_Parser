@@ -9,8 +9,11 @@ from byteconv import getopbyte, getopname
 from commonutilities import invdict
 from byteconv import javabyteparsedict
 from collections import OrderedDict
-import struct
 registeredclasses = {}
+import codeprinter
+import struct
+import functools
+
 class EXEC:
     def __init__(self, string):
         self.string = string
@@ -37,6 +40,10 @@ class M(type):
                     for key, value in classDict["construction"].components.items():
                         olddict[key] = value
                     classDict["construction"].components = olddict
+        if classname in codeprinter.printableclasses:
+            classDict["__str__"] = codeprinter.printableclasses[classname].__str__
+            if classname[0:9] == "CONSTANT_":
+                classDict["ministr"] = codeprinter.printableclasses[classname].ministr
         thing = type.__new__(meta, classname, bases, classDict)
         registeredclasses[thing.__name__] = thing
         return thing
@@ -215,6 +222,9 @@ class ClassFile(metaclass = M):
             self.outputfile = Trackspos(f)
             self.outputfilepath = filepath
             self.writebytes()
+    @staticmethod
+    def addprinters():
+        codeprinter.S.addstr()
         
     class Flags(metaclass = M):
         atomic = True
@@ -509,7 +519,37 @@ class ClassFile(metaclass = M):
             _ = CHOOSE()
         def choose(self):
             return registeredclasses[self.attribute_name_index.value.utf8 + "_attribute"]
-        
+    
+    @property
+    @functools.lru_cache
+    def method_name_list(self):
+        retval = []
+        for method in self.methods:
+            retval.append(method.name_index.value.utf8)
+        return retval
+    
+    @property
+    @functools.lru_cache
+    def field_name_list(self):
+        retval = []
+        for field in self.fields:
+            retval.append(field.name_index.value.utf8)
+        return retval
+    
+    @property
+    @functools.lru_cache
+    def attribute_name_list(self):
+        retval = []
+        for attribute in self.attribute_info:
+            retval.append(attribute.attribute_name_index.value.utf8)
+        return retval
+    
+    def getattribute(self, attributename):
+        try:
+            return self.attribute_info[self.attribute_name_list.index(attributename)]
+        except ValueError:
+            pass
+    
     class field_info(metaclass = M):
         def increment(self):
             self.setonup("_i", self._i + 1)
@@ -570,13 +610,13 @@ class ClassFile(metaclass = M):
     class same_locals_1_stack_item_frame(stack_map_frame, metaclass = M):
         class construction(metaclass = ConstructionMeta):
             _ = EXEC("self.offset_delta = self.frame_type - 64")
-            verification_type_info = Array("verification_type_info", "1")
+            stack = Array("verification_type_info", "1")
 
             
     class same_locals_1_stack_item_frame_extended(stack_map_frame, metaclass = M):
         class construction(metaclass = ConstructionMeta):
-            verification_type_info = Array("verification_type_info", "1")
             offset_delta = "u2"
+            stack = Array("verification_type_info", "1")
     
     class chop_frame(stack_map_frame, metaclass=M):
         class construction(metaclass = ConstructionMeta):
@@ -589,15 +629,15 @@ class ClassFile(metaclass = M):
     class append_frame(stack_map_frame, metaclass=M):
         class construction(metaclass = ConstructionMeta):
             offset_delta = "u2"
-            verification_type_info = Array("verification_type_info", "self.frame_type-251")
+            locals = Array("verification_type_info", "self.frame_type-251")
 
     class full_frame(stack_map_frame, metaclass = M):
         class construction(metaclass = ConstructionMeta):
             offset_delta = "u2"
             number_of_locals = "u2"
-            verification_type_info = Array("verification_type_info", "self.number_of_locals")
+            locals = Array("verification_type_info", "self.number_of_locals")
             number_of_stack_items = "u2"
-            verification_type_info_stack = Array("verification_type_info", "self.number_of_stack_items")
+            stack = Array("verification_type_info", "self.number_of_stack_items")
     class verification_type_info_tag(ThreeWayDict, metaclass = M):
         dype = registeredclasses["u1"]
         bytes2internaldict ={0:"Top",
@@ -682,7 +722,9 @@ class ClassFile(metaclass = M):
         class construction(metaclass = ConstructionMeta):
             class_index = "constant_index"
             method_index = "constant_index"
-    class Synthetic_attribute(attribute, metaclass = M): pass
+    class Synthetic_attribute(attribute, metaclass = M):
+        def parse(self):
+            return self
     
     class Signature_attribute(attribute, metaclass = M):
         class construction(metaclass = ConstructionMeta):
@@ -726,21 +768,23 @@ class ClassFile(metaclass = M):
             index = "u1"
     class LocalVariableTypeTable_attribute(attribute, metaclass = M):
         class local_variable_type_table_entry(metaclass = M):
-            start_pc = "operation_index"
-            length = "u2"
-            name_index = "constant_index"
-            signature_index = "constant_index"
-            index = "local_index_wide"
+            class construction(metaclass = ConstructionMeta):
+                start_pc = "operation_index"
+                length = "u2"
+                name_index = "constant_index"
+                signature_index = "constant_index"
+                index = "local_index_wide"
         class construction(metaclass = ConstructionMeta):
-            local_variable_table_length = "u2"
+            local_variable_type_table_length = "u2"
             local_variable_type_table = Array("local_variable_type_table_entry", "self.local_variable_type_table_length")
     
-    class Deprecated_attribute(attribute, metaclass = M): pass
+    class Deprecated_attribute(attribute, metaclass = M): 
+        def parse(self):
+            return self
     
     class RuntimeVisibleAnnotations_attribute(attribute, metaclass = M):
         class annotations(metaclass = M):
             class element_value_pair(metaclass = M):
-                element_name_index = "constant_index"
                 class element_value_tag(ThreeWayDict, metaclass = M):
                     dype = "utf8"
                     bytes2internaldict = {"byte":"B",
@@ -762,10 +806,12 @@ class ClassFile(metaclass = M):
                         self.length = 1
                         self.code = registeredclasses["utf8"](self).parse()
                         return self.code
-                    def writebytes(self):
-                        registeredclasses["utf8"](self).writebytes(self.code)
+                    def writebytes(self, value):
+                        self.length = 1
+                        registeredclasses["utf8"](self).writebytes(value)
                 class ann_value(metaclass = M):
                     class construction(metaclass = ConstructionMeta):
+                        tag = "element_value_tag"
                         _ = CHOOSE()
                     def choose(self):
                         if self.tag in "BCDFIJSZs":
@@ -792,14 +838,16 @@ class ClassFile(metaclass = M):
                     class construction(metaclass = ConstructionMeta):
                         class_info_index = "constant_index"
 
-                class annotation_value(ann_value, metaclass=M): pass
+                class annotation_value(ann_value, metaclass=M): 
+                    def parse(self):
+                        return self
 
                 class array_value(ann_value, metaclass=M):
                     class construction(metaclass = ConstructionMeta):
                         num_values = "u2"
-                        values = Array("element_value", "self.num_values")
+                        values = Array("ann_value", "self.num_values")
                 class construction(metaclass = ConstructionMeta):
-                    tag = "element_value_tag"
+                    element_name_index = "constant_index"
                     value = "ann_value"
             class construction(metaclass = ConstructionMeta):
                 type_index = "constant_index"
@@ -886,16 +934,16 @@ class ClassFile(metaclass = M):
 
     class op_lindexandbyte(operation, metaclass = M):
         class construction(metaclass = ConstructionMeta):
-            offset = "local_index"
+            lindex = "local_index"
             incint = "byte"
 
     class op_byte(operation, metaclass = M):
         class construction(metaclass = ConstructionMeta):
-            byteint = "byte"
+            int = "byte"
 
     class op_short(operation, metaclass = M):
         class construction(metaclass = ConstructionMeta):
-            shortint = "short"
+            int = "short"
 
     class op_atype(operation, metaclass = M):
         class atype_code(ThreeWayDict, metaclass = M):
@@ -916,6 +964,9 @@ class ClassFile(metaclass = M):
     class short_constant_index(constant_index, metaclass = M):
         class construction(metaclass = ConstructionMeta):
             index = "u1"
+        @property
+        def value(self):
+            return self.constant_pool[self.index]
     class op_lcindex(operation, metaclass = M):
         class construction(metaclass = ConstructionMeta):
             cindex = "short_constant_index"
@@ -932,17 +983,19 @@ class ClassFile(metaclass = M):
         def choose(self):
             assert self.op2 in self._validwideops, f"Invalid opcode after wide: {self.op2} at position {self.file.pos}"
             if self.op2 == "iinc":
-                return registeredclasses["iinc_w"]
+                self.op2 += "_w"
+                return registeredclasses["op_iinc_w"]
             else:
-                return registeredclasses["other_w"]
-    class iinc_w(op_wide, metaclass = M):
+                self.op2 += "_w"
+                return registeredclasses["op_other_w"]
+    class op_iinc_w(op_wide, metaclass = M):
             class construction(metaclass = ConstructionMeta):
-                wlindex = "local_index_wide"
-                wincint = "short"
+                lindex = "local_index_wide"
+                incint = "short"
 
-    class other_w(op_wide, metaclass = M):
+    class op_other_w(op_wide, metaclass = M):
         class construction(metaclass = ConstructionMeta):
-            wlindex = "local_index_wide"
+            lindex = "local_index_wide"
 
     class op_cindexdyn(operation, metaclass = M):
         class construction(metaclass = ConstructionMeta):
@@ -1000,4 +1053,5 @@ class ClassFile(metaclass = M):
                 registeredclasses["u4"](self).writebytes(i)
             for i in self.switchtable:
                 registeredclasses["u4"](self).writebytes(i)
+
 
